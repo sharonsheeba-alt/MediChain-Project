@@ -1,0 +1,720 @@
+// medichain/backend/routes/doctor.js
+// Doctor and Hospital-facing API routes.
+// All routes require: protect (JWT) + authorize('doctor', 'hospital')
+//
+// UPLOAD FLOW:
+//   Frontend → POST /api/doctor/upload-record (multipart)
+//     → IPFS upload (Pinata)
+//     → AI drug-interaction check (Python Flask at :5001)
+//     → If HIGH severity detected → 422 BLOCK
+//     → Else → Save to MongoDB → return record
+//   Frontend → confirm TX on-chain (MetaMask)
+//   Frontend → PATCH /api/doctor/record/:id/txhash (save TX hash to MongoDB)
+
+const express       = require('express');
+const router        = express.Router();
+const multer        = require('multer');
+const axios         = require('axios');
+
+const { protect, authorize }    = require('../middleware/auth');
+const User                      = require('../models/User');
+const MedicalRecord             = require('../models/MedicalRecord');
+const { uploadToIPFS, fetchFromIPFS } = require('../utils/ipfs');
+const { validateFileMagicBytes }= require('../middleware/fileValidator');
+const { encryptBuffer, isEncryptionConfigured } = require('../utils/encryption');
+const { requirePatientAccess } = require('../middleware/patientAccess');
+
+// ── Multer config ─────────────────────────────────────────────────────────────
+// Files are kept in memory (Buffer) — never touch disk — then streamed to IPFS.
+const ALLOWED_MIME_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+];
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10 MB hard cap
+  },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      cb(null, true); // accept file
+    } else {
+      // Pass an error — multer will attach it to req and skip the handler
+      cb(new Error(`File type not allowed: ${file.mimetype}. Use PDF, JPG, or PNG.`), false);
+    }
+  },
+});
+
+// ── Apply auth to every route in this file ────────────────────────────────────
+router.use(protect);
+router.use(authorize('doctor', 'hospital'));
+
+// ── POST /api/doctor/upload-record ────────────────────────────────────────────
+/**
+ * Main upload route — does 5 things in sequence:
+ *  1. Accept multipart: file + patientWalletAddress + recordType + notes + medications
+ *  2. Validate file (multer handles size/type above)
+ *  3. Upload file buffer to IPFS via Pinata → get { cid, url }
+ *  4. Run AI drug-interaction check → block upload if HIGH severity conflict found
+ *  5. Save MedicalRecord to MongoDB
+ *
+ * Form fields:
+ *  - file             (binary)
+ *  - patientWalletAddress (string, required)
+ *  - recordType       (string, required — see enum in MedicalRecord model)
+ *  - notes            (string, optional)
+ *  - medications      (comma-separated string, e.g. "Metformin,Aspirin")
+ */
+router.post('/upload-record', upload.single('file'), validateFileMagicBytes, async (req, res) => {
+  try {
+    // ── 1. Validate required form fields ──────────────────────────────────────
+    const { patientWalletAddress, patientId, identifier, patient: patientParam, recordType, notes, medications } = req.body;
+
+    const targetPatientIdentifier = (patientWalletAddress || patientId || identifier || patientParam || '').trim();
+
+    if (!targetPatientIdentifier) {
+      return res.status(400).json({ error: 'Patient identifier (Patient ID or Wallet Address) is required' });
+    }
+
+    // Normalize recordType
+    let normalizedRecordType = (recordType || 'prescription').toLowerCase().trim();
+    if (normalizedRecordType === 'lab-report') normalizedRecordType = 'lab_report';
+    if (normalizedRecordType === 'imaging')    normalizedRecordType = 'xray';
+    if (normalizedRecordType === 'vaccination') normalizedRecordType = 'other';
+
+    const validTypes = ['prescription', 'lab_report', 'diagnosis', 'xray', 'scan', 'other'];
+    if (!validTypes.includes(normalizedRecordType)) {
+      normalizedRecordType = 'prescription';
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'File is required (PDF, JPG, or PNG)' });
+    }
+
+    // ── 2. Look up the patient in MongoDB (by Wallet Address OR Patient ID OR _id) ─────
+    const isEth = /^0x[a-fA-F0-9]{40}$/i.test(targetPatientIdentifier);
+    let patient = null;
+
+    if (isEth) {
+      patient = await User.findOne({
+        walletAddress: { $regex: new RegExp(`^${targetPatientIdentifier}$`, 'i') },
+        role:          'patient',
+      });
+    } else {
+      const queryList = [
+        { patientId: { $regex: new RegExp(`^${targetPatientIdentifier}$`, 'i') } }
+      ];
+      if (/^[0-9a-fA-F]{24}$/.test(targetPatientIdentifier)) {
+        queryList.push({ _id: targetPatientIdentifier });
+      }
+      patient = await User.findOne({
+        $or: queryList,
+        role: 'patient',
+      });
+    }
+
+    if (!patient) {
+      return res.status(404).json({
+        error: 'No patient found with this identifier. Verify the Patient ID or have the patient register first.',
+      });
+    }
+
+    if (!patient.patientId) {
+      await User.ensurePatientId(patient);
+    }
+
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    // Reload doctor to get walletAddress (req.user comes from protect middleware)
+    const doctor = await User.findById(req.user._id).select('walletAddress name');
+
+    // ── 3. Encrypt file buffer & Upload to IPFS via Pinata ──────────────────
+    let bufferToUpload = req.file.buffer;
+    let encryptionMeta = null;
+    let isEncrypted    = false;
+
+    if (process.env.NODE_ENV === 'production' && !isEncryptionConfigured()) {
+      return res.status(503).json({ error: 'Medical document encryption is not configured. Upload was not completed.' });
+    }
+
+    if (isEncryptionConfigured()) {
+      const encResult = encryptBuffer(req.file.buffer);
+      bufferToUpload  = encResult.encryptedBuffer;
+      isEncrypted     = true;
+      encryptionMeta  = {
+        encryptedKey: encResult.encryptedKey,
+        iv:           encResult.iv,
+        authTag:      encResult.authTag,
+        algorithm:    'aes-256-gcm',
+        encryptedAt:  new Date(),
+      };
+      console.log('[DOCTOR] 🔒 File encrypted with AES-256-GCM before upload');
+    } else {
+      console.warn('[DOCTOR] ⚠️ ENCRYPTION_MASTER_KEY missing! Uploading unencrypted file to IPFS.');
+    }
+
+    // Parse comma-separated medications field into an array
+    const medicationList = medications
+      ? medications.split(',').map((m) => m.trim()).filter(Boolean)
+      : [];
+
+    // ── 4. AI-CDSS Full Prescription Analysis ──────────────────────────
+    // Runs: multi-drug interaction matrix + dosage safety + safety scoring (0–100)
+    // Only run for prescriptions with medications listed.
+    let cdssAnalysis = null;
+
+    if (medicationList.length > 0 && recordType === 'prescription') {
+      try {
+        // Build patient profile from DB
+        const patientFullDoc = await User.findById(patient._id)
+          .select('dateOfBirth allergies chronicConditions');
+
+        const patientAge = patientFullDoc?.dateOfBirth
+          ? new Date().getFullYear() - new Date(patientFullDoc.dateOfBirth).getFullYear()
+          : 45;
+
+        const cdssPayload = {
+          medications: medicationList,
+          dosages:     [],  // No explicit doses in form — extended via OCR or future form fields
+          patient: {
+            age:              patientAge,
+            allergies:        patientFullDoc?.allergies || [],
+            chronicConditions: patientFullDoc?.chronicConditions || [],
+            kidney_gfr:       90,  // Default; updated if patient profile has labs
+            liver_score:      0,
+            pregnant:         false,
+          }
+        };
+
+        // If image/PDF, send file for OCR extraction too
+        if (['image/jpeg','image/jpg','image/png','application/pdf'].includes(req.file.mimetype)) {
+          cdssPayload.file_base64 = req.file.buffer.toString('base64');
+          cdssPayload.mime_type   = req.file.mimetype;
+        }
+
+        const aiResponse = await axios.post(
+          `${process.env.AI_SERVICE_URL || 'http://localhost:5001'}/cdss/analyze`,
+          cdssPayload,
+          { timeout: 30000 }  // Allow longer for OCR + SHAP
+        );
+
+        cdssAnalysis = aiResponse.data;
+        const severity = cdssAnalysis.severity || 'UNKNOWN';
+
+        console.log(`[DOCTOR] CDSS Analysis: score=${cdssAnalysis.safety_score} severity=${severity}`);
+
+        // Block upload on CRITICAL or HIGH severity
+        if (['CRITICAL', 'HIGH'].includes(severity)) {
+          const conflicts = cdssAnalysis.interaction_analysis?.conflicts || [];
+          const dosageIssues = (cdssAnalysis.dosage_analysis || []).filter(d => !d.safe);
+
+          return res.status(422).json({
+            error:       `Upload blocked — ${severity} severity prescription safety issue detected`,
+            severity,
+            safety_score:        cdssAnalysis.safety_score,
+            clinical_explanation: cdssAnalysis.clinical_explanation,
+            conflicts,
+            dosage_warnings:     dosageIssues,
+            recommendations:     cdssAnalysis.recommendations || [],
+            medications:         medicationList,
+          });
+        }
+
+        // Log non-blocking issues
+        if (cdssAnalysis.interaction_analysis?.conflicts?.length > 0) {
+          console.warn(`[DOCTOR] CDSS: ${cdssAnalysis.interaction_analysis.conflicts.length} interaction(s) detected (non-blocking)`);
+        }
+
+      } catch (aiErr) {
+        console.warn('[DOCTOR] CDSS analysis unavailable; prescription upload blocked:', aiErr.message);
+        return res.status(503).json({
+          error: 'Clinical decision support is unavailable. The prescription was not uploaded; retry when the service is available.',
+        });
+      }
+    }
+
+    // Do not write to external storage until required prescription analysis succeeds.
+    const { cid, url: ipfsURL, size: ipfsSize } = await uploadToIPFS(
+      bufferToUpload,
+      req.file.originalname,
+      {
+        patientWalletAddress: patient.walletAddress,
+        recordType,
+        uploadedBy:  doctor?.walletAddress || req.user._id.toString(),
+        timestamp:   new Date().toISOString(),
+        encrypted:   isEncrypted ? 'true' : 'false',
+      }
+    );
+    console.log(`[DOCTOR] IPFS ✅  CID: ${cid}  Size: ${ipfsSize} bytes`);
+
+    // ── 5. Save MedicalRecord to MongoDB ────────────────────────────────
+    const record = await MedicalRecord.create({
+      patientId:            patient._id,
+      patientWalletAddress: patient.walletAddress,
+      doctorId:             req.user._id,
+      doctorWalletAddress:  doctor?.walletAddress || null,
+      ipfsCID:              cid,
+      ipfsURL:              ipfsURL,
+      recordType:           recordType,
+      fileName:             req.file.originalname,
+      // If we use validatedMime, it ensures accuracy over whatever header was sent
+      fileMimeType:         req.file.validatedMime || req.file.mimetype,
+      fileSize:             req.file.size,
+      notes:                notes || '',
+      medications:          medicationList,
+      
+      // Encryption data
+      isEncrypted,
+      ...(encryptionMeta && { encryptionMeta }),
+      // AI Analysis — stored inline if CDSS ran successfully
+      ...(cdssAnalysis && {
+        aiAnalysis: {
+          safetyScore:          cdssAnalysis.safety_score,
+          severity:             cdssAnalysis.severity,
+          interactions:         cdssAnalysis.interaction_analysis?.conflicts || [],
+          dosageWarnings:       (cdssAnalysis.dosage_analysis || []).filter(d => !d.safe),
+          clinicalExplanation:  cdssAnalysis.clinical_explanation,
+          recommendations:      cdssAnalysis.recommendations || [],
+          ocrExtracted:         cdssAnalysis.ocr_extracted || false,
+          extractedMedications: cdssAnalysis.ocr?.medications || [],
+          shapValues:           cdssAnalysis.shap_explanation || null,
+          scoreBreakdown:       cdssAnalysis.score_breakdown || null,
+          analyzedAt:           new Date(),
+        }
+      }),
+    });
+
+    // Return everything the frontend needs
+    return res.status(201).json({
+      success: true,
+      record: {
+        _id:                  record._id,
+        ipfsCID:              record.ipfsCID,
+        ipfsURL:              record.ipfsURL,
+        recordType:           record.recordType,
+        fileName:             record.fileName,
+        fileSize:             record.fileSize,
+        patientWalletAddress: record.patientWalletAddress,  // ← needed for contract call
+        doctorWalletAddress:  record.doctorWalletAddress,
+        uploadedAt:           record.createdAt,
+      },
+    });
+
+  } catch (err) {
+    console.error('[DOCTOR] upload-record error:', err.message);
+
+    // Multer file-type/size errors come through as generic Errors
+    if (err.message?.includes('File type not allowed') || err.message?.includes('File too large')) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    return res.status(500).json({ error: 'Upload failed: ' + err.message });
+  }
+});
+
+// ── PATCH /api/doctor/record/:recordId/txhash ─────────────────────────────────
+/**
+ * Called from the frontend AFTER the MetaMask blockchain transaction is confirmed.
+ * Saves the Ethereum TX hash and block number to the MongoDB record so the
+ * patient's RecordCard can show the "On-Chain ✓" link to Etherscan.
+ *
+ * Body: { txHash: "0x...", blockNumber: 12345678 }
+ */
+router.patch('/record/:recordId/txhash', async (req, res) => {
+  try {
+    const { txHash, blockNumber } = req.body;
+
+    if (!txHash) {
+      return res.status(400).json({ error: 'txHash is required' });
+    }
+
+    // Validate Ethereum TX hash format: 0x + 64 hex chars
+    if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+      return res.status(400).json({ error: 'Invalid transaction hash format' });
+    }
+
+    // Find the record — only the doctor who uploaded it can set the TX hash
+    const record = await MedicalRecord.findOne({
+      _id:      req.params.recordId,
+      doctorId: req.user._id,
+    });
+
+    if (!record) {
+      return res.status(404).json({ error: 'Record not found or access denied' });
+    }
+
+    // Prevent overwriting an already-confirmed TX hash
+    if (record.blockchainTxHash) {
+      return res.status(409).json({
+        error:   'Transaction hash already set for this record',
+        txHash:  record.blockchainTxHash,
+      });
+    }
+
+    // Save the blockchain proof to the record
+    record.blockchainTxHash     = txHash;
+    record.blockchainBlockNumber = blockNumber || null;
+    await record.save();
+
+    return res.status(200).json({ success: true });
+
+  } catch (err) {
+    console.error('[DOCTOR] txhash update error:', err.message);
+    if (err.name === 'CastError') {
+      return res.status(404).json({ error: 'Record not found' });
+    }
+    return res.status(500).json({ error: 'Failed to update transaction hash' });
+  }
+});
+
+// ── GET /api/doctor/record/:recordId/download ─────────────────────────────────
+/**
+ * Doctor-facing route to retrieve and decrypt a patient's medical record.
+ * Strict authorization enforced:
+ *   1. Must be authenticated as doctor or hospital
+ *   2. Must have current on-chain access from the patient's verified wallet
+ *   3. Fetches encrypted ciphertext from IPFS gateway
+ *   4. Decrypts using AES-256-GCM with stored key bundle
+ *   5. Logs audit trail event
+ */
+const { decryptBuffer } = require('../utils/encryption');
+const { auditLog, AuditEvents } = require('../utils/auditLogger');
+
+router.get('/record/:recordId/download', async (req, res) => {
+  try {
+    const record = await MedicalRecord.findOne({
+      _id: req.params.recordId,
+      isActive: true,
+    }).select('+encryptionMeta.encryptedKey +encryptionMeta.authTag');
+
+    if (!record) {
+      return res.status(404).json({ error: 'Record not found' });
+    }
+
+    const patient = await User.findById(record.patientId);
+    if (!patient) return res.status(404).json({ error: 'Patient not found' });
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    // Resiliently fetch ciphertext from IPFS Gateways with multi-gateway fallback
+    let fileBuffer;
+    try {
+      fileBuffer = await fetchFromIPFS(record.ipfsURL || record.ipfsCID);
+    } catch (ipfsErr) {
+      console.error('[DOCTOR] IPFS gateway retrieval failed:', ipfsErr.message);
+      return res.status(502).json({
+        error: 'Medical file temporarily unavailable from decentralized IPFS storage. Please try again shortly.',
+      });
+    }
+
+    // Decrypt if encrypted
+    if (record.isEncrypted && record.encryptionMeta) {
+      try {
+        fileBuffer = decryptBuffer(
+          fileBuffer,
+          record.encryptionMeta.encryptedKey,
+          record.encryptionMeta.iv,
+          record.encryptionMeta.authTag
+        );
+      } catch (decErr) {
+        console.error('[DOCTOR] Decryption failed:', decErr.message);
+        return res.status(500).json({ error: 'Failed to decrypt file content' });
+      }
+    }
+
+    auditLog(AuditEvents.RECORD_ACCESSED, req, {
+      recordId: record._id,
+      patientId: record.patientId,
+      fileName: record.fileName,
+      ipfsCID: record.ipfsCID,
+    });
+
+    res.setHeader('Content-Type', record.fileMimeType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename="${record.fileName}"`);
+    res.setHeader('Content-Length', fileBuffer.length);
+    return res.send(fileBuffer);
+
+  } catch (err) {
+    console.error('[DOCTOR] Record download error:', err.message);
+    if (err.name === 'CastError') return res.status(404).json({ error: 'Record not found' });
+    return res.status(500).json({ error: 'Failed to retrieve file: ' + err.message });
+  }
+});
+
+// ── POST /api/doctor/resolve-patient & /api/doctor/resolve-qr ─────────────────
+/**
+ * Resolves a scanned Patient QR code (JSON or raw ID) or Manual Patient ID / Wallet Address.
+ * Verifies patient identity in MongoDB and returns sanitized authorized profile.
+ */
+const resolvePatientHandler = async (req, res) => {
+  try {
+    const { patientId, qrData, query, identifier } = req.body;
+
+    let targetId = (patientId || query || identifier || '').trim();
+
+    // If qrData is provided, parse structured payload
+    if (qrData && typeof qrData === 'string') {
+      try {
+        const parsed = JSON.parse(qrData.trim());
+        if (parsed && typeof parsed === 'object') {
+          if (parsed.type && parsed.type !== 'MEDICHAIN_PATIENT') {
+            return res.status(400).json({ error: 'This is not a valid MediChain Patient QR.' });
+          }
+          targetId = (parsed.patientId || parsed.walletAddress || parsed.id || '').trim();
+        }
+      } catch {
+        targetId = qrData.trim();
+      }
+    }
+
+    if (!targetId) {
+      return res.status(400).json({ error: 'Patient ID or QR payload is required.' });
+    }
+
+    // Reject arbitrary URLs or non-identifier garbage
+    if (targetId.startsWith('http://') || targetId.startsWith('https://') || targetId.length > 100) {
+      return res.status(400).json({ error: 'This is not a valid MediChain Patient QR.' });
+    }
+
+    const isEthAddress = /^0x[a-fA-F0-9]{40}$/.test(targetId);
+    let patient = null;
+
+    if (isEthAddress) {
+      patient = await User.findOne({
+        walletAddress: { $regex: new RegExp(`^${targetId}$`, 'i') },
+        role: 'patient',
+      });
+    } else {
+      const queryList = [{ patientId: { $regex: new RegExp(`^${targetId}$`, 'i') } }];
+      if (/^[0-9a-fA-F]{24}$/.test(targetId)) {
+        queryList.push({ _id: targetId });
+      }
+      patient = await User.findOne({
+        $or: queryList,
+        role: 'patient',
+      });
+    }
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Patient ID not found.' });
+    }
+
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    // Ensure older patients have a patientId
+    if (!patient.patientId) {
+      await User.ensurePatientId(patient);
+    }
+
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    const recordCount = await MedicalRecord.countDocuments({
+      patientId: patient._id,
+      isActive:  true,
+    });
+
+    const sanitizedPatient = {
+      _id:                    patient._id,
+      patientId:              patient.patientId,
+      name:                   patient.name,
+      walletAddress:          patient.walletAddress || null,
+      isWalletLinked:         patient.isWalletLinked || false,
+      isBlockchainRegistered: patient.isBlockchainRegistered || false,
+      bloodGroup:             patient.bloodGroup || 'Unknown',
+      allergies:              patient.allergies || [],
+      chronicConditions:      patient.chronicConditions || [],
+      clinicalContext:        patient.clinicalContext || {},
+      recordCount,
+    };
+
+    return res.status(200).json({
+      success: true,
+      message: 'Patient identified successfully',
+      patient: sanitizedPatient,
+      ...sanitizedPatient
+    });
+
+  } catch (err) {
+    console.error('[DOCTOR] Resolve patient error:', err.message);
+    return res.status(500).json({ error: 'Failed to resolve patient identity: ' + err.message });
+  }
+};
+
+router.post('/resolve-patient', resolvePatientHandler);
+router.post('/resolve-qr', resolvePatientHandler);
+
+// ── GET /api/doctor/patient/:walletAddress ────────────────────────────────────
+/**
+ * Backward-compatible lookup by wallet address or patient ID param
+ */
+router.get('/patient/:walletAddress', async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    const isEth = /^0x[a-fA-F0-9]{40}$/.test(walletAddress);
+
+    const query = isEth
+      ? { walletAddress: { $regex: new RegExp(`^${walletAddress.trim()}$`, 'i') }, role: 'patient' }
+      : {
+          $or: [
+            { patientId: { $regex: new RegExp(`^${walletAddress.trim()}$`, 'i') } },
+            ...(walletAddress.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: walletAddress }] : [])
+          ],
+          role: 'patient'
+        };
+
+    const patient = await User.findOne(query).select('name bloodGroup allergies chronicConditions walletAddress walletVerified patientId isWalletLinked isBlockchainRegistered');
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    if (!patient.patientId) {
+      await User.ensurePatientId(patient);
+    }
+
+    const recordCount = await MedicalRecord.countDocuments({
+      patientId: patient._id,
+      isActive:  true,
+    });
+
+    const summary = {
+      _id:                    patient._id,
+      patientId:              patient.patientId,
+      name:                   patient.name,
+      walletAddress:          patient.walletAddress,
+      isWalletLinked:         patient.isWalletLinked || false,
+      walletVerified:         patient.walletVerified || false,
+      isBlockchainRegistered: patient.isBlockchainRegistered || false,
+      bloodGroup:             patient.bloodGroup        || 'Unknown',
+      allergies:              patient.allergies         || [],
+      chronicConditions:      patient.chronicConditions || [],
+      recordCount,
+    };
+
+    return res.status(200).json({
+      ...summary,
+      patient: summary,
+    });
+
+  } catch (err) {
+    console.error('[DOCTOR] GET /patient/:wallet error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch patient details' });
+  }
+});
+
+// ── GET /api/doctor/patient-medications/:identifier ───────────────────────────
+/**
+ * Resolves patient medications for prescription CDSS drug-interaction checks.
+ */
+router.get('/patient-medications/:identifier', async (req, res) => {
+  try {
+    const { identifier } = req.params;
+    if (!identifier) return res.status(400).json({ error: 'Patient identifier required' });
+
+    const isEth = /^0x[a-fA-F0-9]{40}$/.test(identifier);
+    let patient = null;
+
+    if (isEth) {
+      patient = await User.findOne({
+        walletAddress: { $regex: new RegExp(`^${identifier.trim()}$`, 'i') },
+        role: 'patient',
+      });
+    } else {
+      const queryList = [{ patientId: identifier.trim().toUpperCase() }];
+      if (/^[0-9a-fA-F]{24}$/.test(identifier)) {
+        queryList.push({ _id: identifier });
+      }
+      patient = await User.findOne({ $or: queryList, role: 'patient' });
+    }
+
+    if (!patient) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    const result = await MedicalRecord.aggregate([
+      {
+        $match: {
+          patientId:  patient._id,
+          recordType: 'prescription',
+          isActive:   true,
+        },
+      },
+      { $unwind: '$medications' },
+      {
+        $group: {
+          _id:         null,
+          medications: { $addToSet: '$medications' },
+        },
+      },
+      { $project: { _id: 0, medications: 1 } },
+    ]);
+
+    const medications = result.length > 0 ? result[0].medications : [];
+    return res.status(200).json({ success: true, medications });
+  } catch (err) {
+    console.error('[DOCTOR] GET /patient-medications error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch patient medications' });
+  }
+});
+
+// ── GET /api/doctor/patients ──────────────────────────────────────────────────
+/**
+ * Paginated list of all registered patients — for the Doctor's PatientRegistry page.
+ * Query params: ?page=1&limit=20
+ */
+router.get('/patients', (req, res) => {
+  return res.status(403).json({
+    error: 'The patient directory is unavailable. Use a patient-shared QR or Patient ID; patient details are returned only after on-chain access is verified.',
+  });
+});
+
+// ── GET /api/doctor/patient-records/:patientIdOrWallet ────────────────────────
+/**
+ * Fetches medical records for a verified patient by Patient ID or Wallet Address.
+ */
+router.get('/patient-records/:patientIdOrWallet', async (req, res) => {
+  try {
+    const { patientIdOrWallet } = req.params;
+    const isEth = /^0x[a-fA-F0-9]{40}$/i.test(patientIdOrWallet);
+
+    const query = isEth
+      ? { walletAddress: { $regex: new RegExp(`^${patientIdOrWallet.trim()}$`, 'i') }, role: 'patient' }
+      : {
+          $or: [
+            { patientId: { $regex: new RegExp(`^${patientIdOrWallet.trim()}$`, 'i') } },
+            ...(patientIdOrWallet.match(/^[0-9a-fA-F]{24}$/) ? [{ _id: patientIdOrWallet }] : [])
+          ],
+          role: 'patient'
+        };
+
+    const patient = await User.findOne(query);
+    if (!patient) {
+      return res.status(404).json({ error: 'Patient not found' });
+    }
+    if (!(await requirePatientAccess(req, res, patient))) return;
+
+    const records = await MedicalRecord.find({
+      patientId: patient._id,
+      isActive:  true,
+    })
+      .populate('doctorId', 'name specialization')
+      .sort({ createdAt: -1 });
+
+    return res.status(200).json({
+      success: true,
+      patientId: patient.patientId,
+      patientWalletAddress: patient.walletAddress,
+      records,
+    });
+
+  } catch (err) {
+    console.error('[DOCTOR] GET /patient-records error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch patient records' });
+  }
+});
+
+module.exports = router;
